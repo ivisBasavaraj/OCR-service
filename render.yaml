@@ -7,7 +7,3 @@ services:
     envVars:
       - key: MODEL_PATH
         value: best.pt
-    disk:
-      name: model-storage
-      mountPath: /opt/render/project/src
-      sizeGB: 1
