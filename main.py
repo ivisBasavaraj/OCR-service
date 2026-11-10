@@ -1,26 +1,18 @@
 """
 Scale OCR Microservice — FastAPI
-Pipeline: YOLOv8 (LCD region detection) + CRNN (digit recognition)
-Based on: https://github.com/OICWS/lcd-digit-recognition
+Uses original YOLOv8 digit-detection model (best.pt) with
+advanced image preprocessing to boost accuracy.
 """
 
 import os
-import io
-import json
 import re
 import numpy as np
 from pathlib import Path
 
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-import cv2
-import torch
-import torch.nn as nn
-from PIL import Image
-import torchvision.transforms as T
-
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from ultralytics import YOLO
+import cv2
 
 app = FastAPI(title="Scale OCR Service")
 
@@ -31,205 +23,204 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Model paths ───────────────────────────────────────────────────────────────
-MODEL_DIR   = Path(os.environ.get("MODEL_DIR", Path(__file__).parent / "models"))
-YOLO_PATH   = MODEL_DIR / "best.pt"
-CRNN_PATH   = MODEL_DIR / "final_crnn.pth"
-CONFIG_PATH = MODEL_DIR / "crnn_config.json"
+# class index → character
+CLASS_MAP = {
+    0: '-',
+    1: '0', 2: '1', 3: '2', 4: '3', 5: '4',
+    6: '5', 7: '6', 8: '7', 9: '8', 10: '9',
+    11: '.',
+}
 
-_yolo  = None
-_crnn  = None
-_cfg   = None
-
-# ── CRNN Architecture (must match training) ───────────────────────────────────
-class CRNN(nn.Module):
-    def __init__(self, num_class):
-        super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
-            nn.MaxPool2d((2, 1)),
-            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
-            nn.MaxPool2d((2, 1)),
-            nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, None)),
-        )
-        self.rnn = nn.LSTM(256, 256, num_layers=2,
-                           bidirectional=True, batch_first=True, dropout=0.3)
-        self.fc  = nn.Linear(512, num_class)
-
-    def forward(self, x):
-        f = self.cnn(x).squeeze(2).permute(0, 2, 1)
-        o, _ = self.rnn(f)
-        return self.fc(o).permute(1, 0, 2)
+MODEL_PATH = os.environ.get("MODEL_PATH", str(Path(__file__).parent / "best.pt"))
+model: YOLO | None = None
 
 
-TRANSFORM = T.Compose([
-    T.Resize((64, 256)),
-    T.ToTensor(),
-    T.Normalize([0.5]*3, [0.5]*3),
-])
-
-
-# ── Startup: load models ──────────────────────────────────────────────────────
 @app.on_event("startup")
-def load_models():
-    global _yolo, _crnn, _cfg
-
-    if not YOLO_PATH.exists():
-        print(f"⚠️  YOLO weights not found at {YOLO_PATH}")
-        return
-    if not CRNN_PATH.exists():
-        print(f"⚠️  CRNN weights not found at {CRNN_PATH}")
-        return
-    if not CONFIG_PATH.exists():
-        print(f"⚠️  CRNN config not found at {CONFIG_PATH}")
-        return
-
-    with open(CONFIG_PATH) as f:
-        _cfg = json.load(f)
-    _cfg.setdefault("min_val", 0.1)
-    _cfg.setdefault("max_val", 9999.9)
-
-    from ultralytics import YOLO
-    _yolo = YOLO(str(YOLO_PATH))
-    print("✅ YOLO loaded")
-
-    _crnn = CRNN(_cfg["num_class"])
-    _crnn.load_state_dict(torch.load(str(CRNN_PATH), map_location="cpu"))
-    _crnn.eval()
-    print("✅ CRNN loaded")
+def load_model():
+    global model
+    if os.path.exists(MODEL_PATH):
+        model = YOLO(MODEL_PATH)
+        print(f"✅ Model loaded from {MODEL_PATH}")
+    else:
+        print(f"⚠️  Model not found at {MODEL_PATH}")
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "yolo_loaded": _yolo is not None,
-        "crnn_loaded": _crnn is not None,
-    }
+    return {"status": "ok", "model_loaded": model is not None}
 
 
-# ── Inference endpoint ────────────────────────────────────────────────────────
 @app.post("/read-scale")
 async def read_scale(file: UploadFile = File(...)):
-    if _yolo is None or _crnn is None:
-        raise HTTPException(status_code=503, detail="OCR models not loaded")
+    if model is None:
+        raise HTTPException(status_code=503, detail="OCR model not loaded")
 
     contents = await file.read()
     np_arr = np.frombuffer(contents, np.uint8)
-    img_cv = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    if img_cv is None:
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img is None:
         raise HTTPException(status_code=400, detail="Invalid image file")
 
-    value, confidence = _run_pipeline(img_cv)
+    # Try multiple preprocessed versions and pick best result
+    reading, confidence = _read_with_best_preprocessing(img)
 
-    if value is None:
-        raise HTTPException(
-            status_code=422,
-            detail="Could not detect or read digits on scale display",
-        )
+    if reading is None:
+        raise HTTPException(status_code=422, detail="Could not detect digits on scale display")
+
+    try:
+        value = float(reading)
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"Non-numeric reading: '{reading}'")
 
     return {
-        "reading": str(value),
+        "reading": reading,
         "valueGrams": round(value, 3),
         "confidence": round(confidence, 3),
     }
 
 
-# ── Pipeline ──────────────────────────────────────────────────────────────────
-def _run_pipeline(img_cv: np.ndarray):
-    """YOLOv8 detects LCD region → CRNN reads digits."""
+# ── Preprocessing variants ────────────────────────────────────────────────────
 
-    # Step 1: YOLO — find LCD bounding box
-    results = _yolo(img_cv, verbose=False, conf=0.3)
-    if not results or len(results[0].boxes) == 0:
-        print("  [YOLO] No LCD region detected")
-        return None, 0.0
+def _preprocess_variants(img: np.ndarray):
+    """Generate multiple preprocessed versions of the image."""
+    variants = []
 
-    boxes    = results[0].boxes
-    best_idx = boxes.conf.argmax().item()
-    box      = boxes.xyxy[best_idx].cpu().numpy()
-    yolo_conf = boxes.conf[best_idx].item()
-    print(f"  [YOLO] conf={yolo_conf:.2f}")
+    # 1. Original (just resized)
+    variants.append(("original", img.copy()))
 
-    # Step 2: Crop LCD region
-    crop = _crop_lcd(img_cv, box)
-    if crop is None or crop.size == 0:
-        return None, 0.0
+    # 2. CLAHE — contrast limited adaptive histogram equalization
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    clahe_img = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    variants.append(("clahe", clahe_img))
 
-    # Step 3: CRNN — read digits from crop
-    crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-    crop_pil = _smart_resize(crop_pil)
-    tensor   = TRANSFORM(crop_pil).unsqueeze(0)
+    # 3. Sharpened
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharp = cv2.filter2D(img, -1, kernel)
+    variants.append(("sharp", sharp))
 
-    with torch.no_grad():
-        log_probs = _crnn(tensor).log_softmax(2)
+    # 4. Denoised + sharpened
+    denoised = cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
+    sharp_denoised = cv2.filter2D(denoised, -1, kernel)
+    variants.append(("denoise+sharp", sharp_denoised))
 
-    pred_str, crnn_conf = _decode(log_probs[:, 0, :])
-    print(f"  [CRNN] pred='{pred_str}' conf={crnn_conf:.3f}")
+    # 5. Brightness boosted (for dark/underexposed images)
+    bright = cv2.convertScaleAbs(img, alpha=1.3, beta=30)
+    variants.append(("bright", bright))
 
-    value = _validate(pred_str)
-    return value, crnn_conf
+    # 6. CLAHE + sharpened
+    clahe_sharp = cv2.filter2D(clahe_img, -1, kernel)
+    variants.append(("clahe+sharp", clahe_sharp))
 
-
-def _crop_lcd(img_cv, box_xyxy, pad=5):
-    h, w = img_cv.shape[:2]
-    x1, y1, x2, y2 = box_xyxy.astype(int)
-    x1 = max(0, x1 - pad)
-    y1 = max(0, y1 - pad)
-    x2 = min(w, x2 + pad)
-    y2 = min(h, y2 + pad)
-    return img_cv[y1:y2, x1:x2]
+    return variants
 
 
-def _smart_resize(img: Image.Image) -> Image.Image:
-    w, h = img.size
-    if w > 400:
-        scale = 300 / w
-        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-    return img
+# ── Core detection ────────────────────────────────────────────────────────────
+
+def _read_with_best_preprocessing(img: np.ndarray):
+    """
+    Try all preprocessing variants, return the result with
+    highest confidence and most digits detected.
+    """
+    variants = _preprocess_variants(img)
+    best_reading = None
+    best_conf = 0.0
+    best_score = -1
+
+    for name, processed in variants:
+        reading, conf, n_digits = _yolo_read(processed)
+        if reading is None:
+            continue
+
+        # Score = number of digits detected * confidence
+        # Prefer readings with decimal point (more precise)
+        has_dot = '.' in reading
+        score = n_digits * conf * (1.2 if has_dot else 1.0)
+
+        print(f"  [{name}] reading={reading} conf={conf:.3f} digits={n_digits} score={score:.3f}")
+
+        if score > best_score:
+            best_score = score
+            best_reading = reading
+            best_conf = conf
+
+    return best_reading, best_conf
 
 
-def _decode(log_probs_t):
-    """CTC greedy decode with confidence."""
-    chars = _cfg["chars"]
-    blank = _cfg["blank"]
-    probs = log_probs_t.exp()
-    ids   = log_probs_t.argmax(-1).tolist()
-    max_p = probs.max(-1).values.tolist()
+def _yolo_read(img: np.ndarray):
+    """
+    Run YOLO on image, sort boxes left-to-right, assemble numeric string.
+    Returns (reading_str, avg_confidence, digit_count) or (None, 0.0, 0).
+    """
+    # Run at multiple confidence thresholds — lower conf catches faint digits
+    for conf_thresh in [0.35, 0.25, 0.15]:
+        results = model(img, verbose=False, conf=conf_thresh)[0]
+        boxes = results.boxes
 
-    out_chars, char_confs, prev = [], [], None
-    for i, p in zip(ids, max_p):
-        if i != blank and i != prev:
-            out_chars.append(chars[i])
-            char_confs.append(p)
-        prev = i
+        if boxes is None or len(boxes) == 0:
+            continue
 
-    pred = "".join(out_chars)
-    conf = float(min(char_confs)) if char_confs else 0.0
-    return pred, conf
+        detections = []
+        for box in boxes:
+            cls_id   = int(box.cls[0].item())
+            conf     = float(box.conf[0].item())
+            x_center = float(box.xywh[0][0].item())
+            char = CLASS_MAP.get(cls_id)
+            if char is not None:
+                detections.append((x_center, char, conf))
+
+        if not detections:
+            continue
+
+        # Remove duplicate detections at same x position (keep highest conf)
+        detections = _deduplicate(detections)
+
+        # Sort left-to-right
+        detections.sort(key=lambda d: d[0])
+
+        reading  = ''.join(d[1] for d in detections)
+        avg_conf = sum(d[2] for d in detections) / len(detections)
+
+        reading = _sanitise(reading)
+        if reading is None:
+            continue
+
+        return reading, avg_conf, len(detections)
+
+    return None, 0.0, 0
 
 
-def _validate(pred_str: str):
-    """Validate format and range."""
-    if not re.match(r"^\d+\.?\d*$", pred_str):
-        print(f"  [WARN] Invalid format: '{pred_str}'")
+def _deduplicate(detections, overlap_px=15):
+    """
+    Remove duplicate boxes at nearly the same x position.
+    Keep the one with highest confidence.
+    """
+    detections = sorted(detections, key=lambda d: d[2], reverse=True)
+    kept = []
+    for det in detections:
+        x = det[0]
+        if not any(abs(x - k[0]) < overlap_px for k in kept):
+            kept.append(det)
+    return kept
+
+
+def _sanitise(raw: str) -> str | None:
+    """Clean assembled string into a valid numeric reading."""
+    # Remove leading/trailing non-numeric chars
+    match = re.search(r'-?\d+\.?\d*', raw)
+    if not match:
         return None
+    val_str = match.group(0)
+    # Validate range (gold weight: 0.001g to 9999g)
     try:
-        val = float(pred_str)
+        val = float(val_str)
+        if val < 0.001 or val > 9999.999:
+            return None
     except ValueError:
         return None
-    min_val = _cfg.get("min_val", 0.1)
-    max_val = _cfg.get("max_val", 9999.9)
-    if not (min_val <= val <= max_val):
-        print(f"  [WARN] Out of range [{min_val}, {max_val}]: {val}")
-        return None
-    return val
+    return val_str
 
 
 if __name__ == "__main__":
