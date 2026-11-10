@@ -1,7 +1,10 @@
 """
 Scale OCR Microservice — FastAPI
-Uses original YOLOv8 digit-detection model (best.pt) with
-advanced image preprocessing to boost accuracy.
+Pipeline:
+  1. Detect the LCD display region (brightest horizontal band)
+  2. Crop + upscale that region to 640px height
+  3. Run YOLO digit detection on the upscaled crop
+  4. Assemble reading left-to-right
 """
 
 import os
@@ -23,7 +26,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# class index → character
+# class index → character  (matches data.yaml order)
 CLASS_MAP = {
     0: '-',
     1: '0', 2: '1', 3: '2', 4: '3', 5: '4',
@@ -61,8 +64,7 @@ async def read_scale(file: UploadFile = File(...)):
     if img is None:
         raise HTTPException(status_code=400, detail="Invalid image file")
 
-    # Try multiple preprocessed versions and pick best result
-    reading, confidence = _read_with_best_preprocessing(img)
+    reading, confidence = _read_scale(img)
 
     if reading is None:
         raise HTTPException(status_code=422, detail="Could not detect digits on scale display")
@@ -79,16 +81,84 @@ async def read_scale(file: UploadFile = File(...)):
     }
 
 
-# ── Preprocessing variants ────────────────────────────────────────────────────
+# ── Step 1: LCD region detection ─────────────────────────────────────────────
+
+def _find_lcd_roi(img: np.ndarray):
+    """
+    Find the LCD display region using brightness analysis.
+    LCD displays are typically the brightest horizontal band in the image.
+    Returns (x1, y1, x2, y2) or None to use full image.
+    """
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Blur to reduce noise
+    blurred = cv2.GaussianBlur(gray, (21, 21), 0)
+
+    # Find brightest row band (LCD backlight)
+    row_brightness = np.mean(blurred, axis=1)
+    smooth = np.convolve(row_brightness, np.ones(20) / 20, mode='same')
+
+    # Find peak brightness region
+    peak_row = int(np.argmax(smooth))
+    threshold = smooth[peak_row] * 0.75
+
+    # Expand from peak until brightness drops below threshold
+    top = peak_row
+    while top > 0 and smooth[top] > threshold:
+        top -= 1
+
+    bottom = peak_row
+    while bottom < h - 1 and smooth[bottom] > threshold:
+        bottom += 1
+
+    # Add 20% padding
+    pad_v = max(10, int((bottom - top) * 0.2))
+    top = max(0, top - pad_v)
+    bottom = min(h, bottom + pad_v)
+
+    # For columns: use center 80% (avoid scale frame edges)
+    left = int(w * 0.05)
+    right = int(w * 0.95)
+
+    roi_h = bottom - top
+    roi_w = right - left
+
+    # Only use ROI if it's a meaningful crop (not the whole image)
+    if roi_h < h * 0.8 and roi_h > h * 0.03:
+        return left, top, right, bottom
+
+    return None
+
+
+def _crop_and_upscale(img: np.ndarray, roi):
+    """Crop to ROI and upscale so digit height is ~40-60px (good for YOLO)."""
+    if roi is None:
+        return img
+
+    x1, y1, x2, y2 = roi
+    crop = img[y1:y2, x1:x2]
+
+    h, w = crop.shape[:2]
+    if h == 0 or w == 0:
+        return img
+
+    # Upscale so the crop height is at least 320px
+    target_h = max(320, h)
+    if h < target_h:
+        scale = target_h / h
+        new_w = int(w * scale)
+        crop = cv2.resize(crop, (new_w, target_h), interpolation=cv2.INTER_CUBIC)
+
+    return crop
+
+
+# ── Step 2: Preprocessing variants ───────────────────────────────────────────
 
 def _preprocess_variants(img: np.ndarray):
-    """Generate multiple preprocessed versions of the image."""
-    variants = []
+    variants = [("original", img.copy())]
 
-    # 1. Original (just resized)
-    variants.append(("original", img.copy()))
-
-    # 2. CLAHE — contrast limited adaptive histogram equalization
+    # CLAHE
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -96,67 +166,30 @@ def _preprocess_variants(img: np.ndarray):
     clahe_img = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
     variants.append(("clahe", clahe_img))
 
-    # 3. Sharpened
+    # Sharpened
     kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    sharp = cv2.filter2D(img, -1, kernel)
-    variants.append(("sharp", sharp))
+    variants.append(("clahe+sharp", cv2.filter2D(clahe_img, -1, kernel)))
 
-    # 4. Denoised + sharpened
-    denoised = cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
-    sharp_denoised = cv2.filter2D(denoised, -1, kernel)
-    variants.append(("denoise+sharp", sharp_denoised))
+    # Brightness boost (dark displays)
+    variants.append(("bright", cv2.convertScaleAbs(img, alpha=1.4, beta=40)))
 
-    # 5. Brightness boosted (for dark/underexposed images)
-    bright = cv2.convertScaleAbs(img, alpha=1.3, beta=30)
-    variants.append(("bright", bright))
-
-    # 6. CLAHE + sharpened
-    clahe_sharp = cv2.filter2D(clahe_img, -1, kernel)
-    variants.append(("clahe+sharp", clahe_sharp))
+    # Gamma correction (overexposed displays)
+    gamma_img = np.power(img / 255.0, 1.5) * 255
+    variants.append(("gamma", gamma_img.astype(np.uint8)))
 
     return variants
 
 
-# ── Core detection ────────────────────────────────────────────────────────────
-
-def _read_with_best_preprocessing(img: np.ndarray):
-    """
-    Try all preprocessing variants, return the result with
-    highest confidence and most digits detected.
-    """
-    variants = _preprocess_variants(img)
-    best_reading = None
-    best_conf = 0.0
-    best_score = -1
-
-    for name, processed in variants:
-        reading, conf, n_digits = _yolo_read(processed)
-        if reading is None:
-            continue
-
-        # Score = number of digits detected * confidence
-        # Prefer readings with decimal point (more precise)
-        has_dot = '.' in reading
-        score = n_digits * conf * (1.2 if has_dot else 1.0)
-
-        print(f"  [{name}] reading={reading} conf={conf:.3f} digits={n_digits} score={score:.3f}")
-
-        if score > best_score:
-            best_score = score
-            best_reading = reading
-            best_conf = conf
-
-    return best_reading, best_conf
-
+# ── Step 3: YOLO inference ────────────────────────────────────────────────────
 
 def _yolo_read(img: np.ndarray):
     """
-    Run YOLO on image, sort boxes left-to-right, assemble numeric string.
-    Returns (reading_str, avg_confidence, digit_count) or (None, 0.0, 0).
+    Run YOLO, deduplicate, sort left-to-right, return (reading, conf, n_digits).
     """
-    # Run at multiple confidence thresholds — lower conf catches faint digits
-    for conf_thresh in [0.35, 0.25, 0.15]:
-        results = model(img, verbose=False, conf=conf_thresh)[0]
+    h, w = img.shape[:2]
+
+    for conf_thresh in [0.30, 0.20, 0.12]:
+        results = model(img, verbose=False, conf=conf_thresh, imgsz=640)[0]
         boxes = results.boxes
 
         if boxes is None or len(boxes) == 0:
@@ -167,17 +200,20 @@ def _yolo_read(img: np.ndarray):
             cls_id   = int(box.cls[0].item())
             conf     = float(box.conf[0].item())
             x_center = float(box.xywh[0][0].item())
+            box_w    = float(box.xywh[0][2].item())
             char = CLASS_MAP.get(cls_id)
             if char is not None:
-                detections.append((x_center, char, conf))
+                detections.append((x_center, char, conf, box_w))
 
         if not detections:
             continue
 
-        # Remove duplicate detections at same x position (keep highest conf)
-        detections = _deduplicate(detections)
+        # Adaptive dedup: overlap threshold = median box width * 0.5
+        widths = [d[3] for d in detections]
+        median_w = float(np.median(widths)) if widths else 15
+        overlap_thresh = max(8, median_w * 0.5)
 
-        # Sort left-to-right
+        detections = _deduplicate(detections, overlap_thresh)
         detections.sort(key=lambda d: d[0])
 
         reading  = ''.join(d[1] for d in detections)
@@ -192,11 +228,7 @@ def _yolo_read(img: np.ndarray):
     return None, 0.0, 0
 
 
-def _deduplicate(detections, overlap_px=15):
-    """
-    Remove duplicate boxes at nearly the same x position.
-    Keep the one with highest confidence.
-    """
+def _deduplicate(detections, overlap_px):
     detections = sorted(detections, key=lambda d: d[2], reverse=True)
     kept = []
     for det in detections:
@@ -206,17 +238,52 @@ def _deduplicate(detections, overlap_px=15):
     return kept
 
 
+# ── Step 4: Best result selection ────────────────────────────────────────────
+
+def _read_scale(img: np.ndarray):
+    """Full pipeline: ROI crop → upscale → multi-variant inference → best pick."""
+    roi = _find_lcd_roi(img)
+    cropped = _crop_and_upscale(img, roi)
+
+    # Also try full image as fallback
+    candidates = [cropped]
+    if roi is not None:
+        candidates.append(img)  # fallback: full image
+
+    best_reading = None
+    best_conf = 0.0
+    best_score = -1
+
+    for source_img in candidates:
+        for name, processed in _preprocess_variants(source_img):
+            reading, conf, n_digits = _yolo_read(processed)
+            if reading is None:
+                continue
+
+            has_dot = '.' in reading
+            score = n_digits * conf * (1.3 if has_dot else 1.0)
+
+            print(f"  [{name}] reading={reading} conf={conf:.3f} digits={n_digits} score={score:.3f}")
+
+            if score > best_score:
+                best_score = score
+                best_reading = reading
+                best_conf = conf
+
+    return best_reading, best_conf
+
+
+# ── Sanitise ──────────────────────────────────────────────────────────────────
+
 def _sanitise(raw: str) -> str | None:
-    """Clean assembled string into a valid numeric reading."""
-    # Remove leading/trailing non-numeric chars
     match = re.search(r'-?\d+\.?\d*', raw)
     if not match:
         return None
     val_str = match.group(0)
-    # Validate range (gold weight: 0.001g to 9999g)
     try:
         val = float(val_str)
-        if val < 0.001 or val > 9999.999:
+        # Valid range: 0.000g (zero/tare) to 9999g
+        if val < 0.0 or val > 9999.999:
             return None
     except ValueError:
         return None
